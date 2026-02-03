@@ -171,6 +171,7 @@ ELECTRICITY_SENSORS = [
         "state_class": SensorStateClass.TOTAL,
         "icon": "mdi:cash",
         "meter_interval": MeterInterval.DAY,
+        # is ignored in favour of special case in logic below
         "func": lambda js: round(
             js["electricitymeter"]["energy"]["import"]["price"]["standingcharge"]
             + (
@@ -255,7 +256,7 @@ GAS_SENSORS = [
         "unit_of_measurement": "GBP/kWh",
         "state_class": SensorStateClass.TOTAL,
         "icon": "mdi:cash",
-        "func": lambda js: js["gasmeter"]["energy"]["import"]["price"]["unitrate"]*10,
+        "func": lambda js: js["gasmeter"]["energy"]["import"]["price"]["unitrate"] * 10,
         "ignore_zero_values": True,
     },
     {
@@ -289,7 +290,7 @@ GAS_SENSORS = [
             (js["gasmeter"]["energy"]["import"]["price"]["standingcharge"] or 0)
             + (
                 (js["gasmeter"]["energy"]["import"]["day"] or 0)
-                * (js["gasmeter"]["energy"]["import"]["price"]["unitrate"]*10 or 0)
+                * (js["gasmeter"]["energy"]["import"]["price"]["unitrate"] * 10 or 0)
             ),
             2,
         ),
@@ -302,7 +303,10 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
     # the config is defaulted to + which happens to mean we will subscribe to all devices
     device_mac = hass.data[DOMAIN][config_entry.entry_id][CONF_DEVICE_ID]
-    topic_prefix = hass.data[DOMAIN][config_entry.entry_id][CONF_TOPIC_PREFIX] or DEFAULT_TOPIC_PREFIX
+    topic_prefix = (
+        hass.data[DOMAIN][config_entry.entry_id][CONF_TOPIC_PREFIX]
+        or DEFAULT_TOPIC_PREFIX
+    )
     time_zone_electricity = hass.data[DOMAIN][config_entry.entry_id][
         CONF_TIME_ZONE_ELECTRICITY
     ]
@@ -373,7 +377,11 @@ class HildebrandGlowMqttSensorUpdateGroup:
     """Representation of Hildebrand Glow MQTT Meter Sensors that all get updated together."""
 
     def __init__(
-        self, device_id: str, topic_regex: str, meters: Iterable, time_zone: str | None = None
+        self,
+        device_id: str,
+        topic_regex: str,
+        meters: Iterable,
+        time_zone: str | None = None,
     ) -> None:
         """Initialize the sensor collection."""
         self._topic_regex = re.compile(topic_regex)
@@ -444,10 +452,14 @@ class HildebrandGlowMqttSensor(SensorEntity):
         if state_class == SensorStateClass.TOTAL and meter_interval:
             self._attr_last_reset = None
             self._last_reset_reported = True
+        self._cost_today = None
+        self._current_day = datetime.now().day
 
     @staticmethod
     def determine_last_reset(
-        message_datetime: datetime, meter_timezone: tzinfo, meter_interval: MeterInterval
+        message_datetime: datetime,
+        meter_timezone: tzinfo,
+        meter_interval: MeterInterval,
     ) -> datetime:
         """Return midnight of the meter's reset interval in UTC."""
         meter_datetime = message_datetime.astimezone(meter_timezone)
@@ -479,7 +491,36 @@ class HildebrandGlowMqttSensor(SensorEntity):
 
     def process_update(self, mqtt_data) -> None:
         """Update the state of the sensor."""
-        new_value = self._func(mqtt_data)
+
+        # special case for electricity cost tracker
+        if self._attr_name == "Smart Meter Electricity: Cost (Today)":
+            em = mqtt_data.get("electricitymeter", {})
+            energy = em.get("energy", {}).get("import", {})
+            price = energy.get("price", {}) or {}
+            today_kwh = float(energy.get("day") or 0.0)
+            unit_rate = float(price.get("unitrate") or 0.0)
+            standing = float(price.get("standingcharge") or 0.0)
+            new_value = standing + today_kwh * unit_rate
+            # deal with the smart meter resetting *prior* to midnight
+            # which results in the initial cost for the following day
+            # being stored
+            if self._cost_today is None or new_value > self._cost_today:
+                # track current value
+                self._cost_today = new_value
+            elif new_value < self._cost_today:
+                # if latest value is now lower than previous, the
+                # meter has reset but also check if it's now 'tomorrow'
+                current_day = datetime.now().day
+                if current_day == self._current_day:
+                    # it's not so keep reporting the last value
+                    new_value = self._cost_today
+                else:
+                    # crossed to following day, reset the day tracker
+                    self._current_day = current_day
+                    self._cost_today = new_value
+        else:
+            new_value = self._func(mqtt_data)
+
         if self._ignore_zero_values and new_value == 0:
             _LOGGER.debug(
                 "Ignored new value of %s on %s.", new_value, self._attr_unique_id
@@ -497,15 +538,14 @@ class HildebrandGlowMqttSensor(SensorEntity):
         zoneInfo = None
         if self._time_zone:
             zoneInfo = self._time_zone
-        elif (self.hass is not None and 
-              self.hass.config is not None):
+        elif self.hass is not None and self.hass.config is not None:
             zoneInfo = self.hass.config.time_zone
-            
+
         if zoneInfo and self._last_reset_reported and self._meter_interval:
             self._attr_last_reset = self.determine_last_reset(
                 self.get_message_datetime(mqtt_data),
                 ZoneInfo(zoneInfo),
-                self._meter_interval
+                self._meter_interval,
             )
 
         if (
