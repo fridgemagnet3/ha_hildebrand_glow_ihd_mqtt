@@ -168,7 +168,7 @@ ELECTRICITY_SENSORS = [
         "name": "Smart Meter Electricity: Cost (Today)",
         "device_class": SensorDeviceClass.MONETARY,
         "unit_of_measurement": "GBP",
-        "state_class": SensorStateClass.TOTAL,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
         "icon": "mdi:cash",
         "meter_interval": MeterInterval.DAY,
         # is ignored in favour of special case in logic below
