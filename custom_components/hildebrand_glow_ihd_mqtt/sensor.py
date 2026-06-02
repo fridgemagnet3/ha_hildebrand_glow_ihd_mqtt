@@ -256,7 +256,10 @@ GAS_SENSORS = [
         "unit_of_measurement": "GBP/kWh",
         "state_class": SensorStateClass.TOTAL,
         "icon": "mdi:cash",
-        "func": lambda js: js["gasmeter"]["energy"]["import"]["price"]["unitrate"] * 10,
+        "func": lambda js: (
+            js["gasmeter"]["energy"]["import"]["price"]["unitrate"] or 0
+        )
+        * 10,
         "ignore_zero_values": True,
     },
     {
@@ -290,7 +293,8 @@ GAS_SENSORS = [
             (js["gasmeter"]["energy"]["import"]["price"]["standingcharge"] or 0)
             + (
                 (js["gasmeter"]["energy"]["import"]["day"] or 0)
-                * (js["gasmeter"]["energy"]["import"]["price"]["unitrate"] * 10 or 0)
+                * (js["gasmeter"]["energy"]["import"]["price"]["unitrate"] or 0)
+                * 10
             ),
             2,
         ),
