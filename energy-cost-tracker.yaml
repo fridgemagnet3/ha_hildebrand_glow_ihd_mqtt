@@ -1,0 +1,122 @@
+# energy smart display cost trackers
+# https://github.com/megakid/ha_hildebrand_glow_ihd_mqtt/issues/77
+# with updates to support multi-tariff (electric only)
+#
+- trigger:
+    # Trigger 1: Whenever the cumulative energy value updates from MQTT
+    - platform: state
+      entity_id: sensor.smart_meter_electricity_import
+    # Trigger 2: At one second past midnight to "bill" the daily standing charge
+    - platform: time
+      at: "00:00:01"
+  sensor:
+    - name: "Electricity Total Lifetime Cost"
+      unique_id: electricity_total_lifetime_cost
+      device_class: monetary
+      state_class: total
+      unit_of_measurement: "GBP"
+      state: >
+        {% set energy_raw = states('sensor.smart_meter_electricity_import') %}
+        {% set rate_raw = states('sensor.smart_meter_electricity_import_unit_rate') %}
+        {% set standing_charge = states('sensor.smart_meter_electricity_import_standing_charge') | float(0) %}
+        {% set current_acc = state_attr('sensor.electricity_total_lifetime_cost', 'acc_standing_charge') | float(0) %}
+        {% set last_energy = state_attr('sensor.electricity_total_lifetime_cost', 'last_energy') | float(0) %}
+        {% set acc_energy_charge = state_attr('sensor.electricity_total_lifetime_cost', 'acc_energy_charge') | float(0) %}
+
+        {# Strict Positive Check: Must be a number and greater than zero #}
+        {% if is_number(energy_raw) and is_number(rate_raw) and energy_raw | float > 0 and rate_raw | float > 0 %}
+          {% set energy = energy_raw | float %}
+          {% set rate = rate_raw | float %}
+          
+          {% if trigger.platform == 'time' %}
+            {% set current_acc = current_acc + standing_charge %}
+          {% endif %}
+          
+          {{ ( acc_energy_charge + ((energy-last_energy) * rate) + current_acc) | round(2) }}
+        {% else %}
+          {# Maintain the last known good state to prevent a dip #}
+          {{ states('sensor.electricity_total_lifetime_cost') }}
+        {% endif %}
+      attributes:
+        # happens AFTER the main state changes (and relies on this to work)
+        acc_standing_charge: >
+          {% set current_acc = state_attr('sensor.electricity_total_lifetime_cost', 'acc_standing_charge') | float(0) %}
+          {% set standing_charge = states('sensor.smart_meter_electricity_import_standing_charge') | float(0) %}
+          {% if trigger.platform == 'time' %}
+            {{ (current_acc + standing_charge) | round(2) }}
+          {% else %}
+            {{ current_acc | round(2) }}
+          {% endif %}
+        last_energy: >
+          {% set last_energy = state_attr('sensor.electricity_total_lifetime_cost', 'last_energy') | float(0) %}
+          {% if trigger.platform == 'state' %}
+            {% set energy_raw = states('sensor.smart_meter_electricity_import') %}
+            {# Strict Positive Check: Must be a number and greater than zero #}
+            {% if is_number(energy_raw) and energy_raw | float > 0  %}
+              {% set energy = energy_raw | float %}
+              {{ energy }}
+            {% else %}
+              {{ last_energy }}
+            {% endif %}
+          {% else %}
+            {{ last_energy }}
+          {% endif %}
+        acc_energy_charge: >
+          {% set acc_energy_charge = state_attr('sensor.electricity_total_lifetime_cost', 'acc_energy_charge') | float(0) %}
+          {% if trigger.platform == 'state' %}
+            {% set last_energy = state_attr('sensor.electricity_total_lifetime_cost', 'last_energy') | float(0) %}
+            {% set energy_raw = states('sensor.smart_meter_electricity_import') %}
+            {% set rate_raw = states('sensor.smart_meter_electricity_import_unit_rate') %}
+            {# Strict Positive Check: Must be a number and greater than zero #}
+            {% if is_number(energy_raw) and is_number(rate_raw) and energy_raw | float > 0 and rate_raw | float > 0 %}
+              {% set energy = energy_raw | float %}
+              {% set rate = rate_raw | float %}
+              {{ ( acc_energy_charge + ((energy-last_energy) * rate))  }}
+            {% else %}
+              {{ acc_energy_charge }}
+            {% endif %}
+          {% else %}
+            {{ acc_energy_charge }}
+          {% endif %}
+
+- trigger:
+    # Trigger 1: Whenever the cumulative gas energy (kWh) updates
+    - platform: state
+      entity_id: sensor.smart_meter_gas_import
+    # Trigger 2: At one second past midnight to add the daily standing charge
+    - platform: time
+      at: "00:00:01"
+  sensor:
+    - name: "Gas Total Lifetime Cost"
+      unique_id: gas_total_lifetime_cost
+      device_class: monetary
+      state_class: total
+      unit_of_measurement: "GBP"
+      state: >
+        {% set energy_raw = states('sensor.smart_meter_gas_import') %}
+        {% set rate_raw = states('sensor.smart_meter_gas_import_unit_rate') %}
+        {% set standing_charge = states('sensor.smart_meter_gas_import_standing_charge') | float(0) %}
+        {% set current_acc = state_attr('sensor.gas_total_lifetime_cost', 'acc_standing_charge') | float(0) %}
+
+        {# Strict Positive Check: Must be a number and greater than zero #}
+        {% if is_number(energy_raw) and is_number(rate_raw) and energy_raw | float > 0 and rate_raw | float > 0 %}
+          {% set energy = energy_raw | float %}
+          {% set rate = rate_raw | float %}
+
+          {% if trigger.platform == 'time' %}
+            {% set current_acc = current_acc + standing_charge %}
+          {% endif %}
+          
+          {{ ((energy * rate) + current_acc) | round(2) }}
+        {% else %}
+          {{ states('sensor.gas_total_lifetime_cost') }}
+        {% endif %}
+      attributes:
+        acc_standing_charge: >
+          {% set current_acc = state_attr('sensor.gas_total_lifetime_cost', 'acc_standing_charge') | float(0) %}
+          {% set standing_charge = states('sensor.smart_meter_gas_import_standing_charge') | float(0) %}
+          {% if trigger.platform == 'time' %}
+            {{ (current_acc + standing_charge) | round(2) }}
+          {% else %}
+            {{ current_acc | round(2) }}
+          {% endif %}
