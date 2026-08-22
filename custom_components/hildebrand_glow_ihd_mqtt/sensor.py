@@ -25,6 +25,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
+from homeassistant.helpers.restore_state import RestoreEntity  # NEW
 from homeassistant.util import slugify
 
 from .const import (
@@ -171,6 +172,7 @@ ELECTRICITY_SENSORS = [
         "state_class": SensorStateClass.TOTAL,
         "icon": "mdi:cash",
         "meter_interval": MeterInterval.DAY,
+        # func is ignored by special-case accrual logic below
         "func": lambda js: round(
             js["electricitymeter"]["energy"]["import"]["price"]["standingcharge"]
             + (
@@ -272,7 +274,7 @@ GAS_SENSORS = [
     # Removed June 2022 in IHD software update 1.8.13
     # {
     #   "name": "Smart Meter Gas: Power",
-    #   "device_class": SensorDeviceClass.POWER,
+    #   "device_class": SensorDeviceClass.POWER",
     #   "unit_of_measurement": UnitOfPower.KILO_WATT,
     #   "state_class": SensorStateClass.MEASUREMENT,
     #   "icon": "mdi:fire",
@@ -393,12 +395,12 @@ class HildebrandGlowMqttSensorUpdateGroup:
                 sensor.process_update(parsed_data)
 
     @property
-    def all_sensors(self) -> Iterable[HildebrandGlowMqttSensor]:
+    def all_sensors(self) -> Iterable["HildebrandGlowMqttSensor"]:
         """Return all meters."""
         return self._sensors
 
 
-class HildebrandGlowMqttSensor(SensorEntity):
+class HildebrandGlowMqttSensor(RestoreEntity, SensorEntity):
     """Representation of a room sensor that is updated via MQTT."""
 
     def __init__(
@@ -445,6 +447,33 @@ class HildebrandGlowMqttSensor(SensorEntity):
             self._attr_last_reset = None
             self._last_reset_reported = True
 
+        # Incremental cost accrual trackers (used by Electricity Cost Today)
+        self._cost_accum: float | None = None
+        self._prev_kwh: float | None = None
+        self._prev_rate: float | None = None
+        self._last_reset_utc: str | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore state for cost accrual sensor."""
+        await super().async_added_to_hass()
+        if self._attr_name != "Smart Meter Electricity: Cost (Today)":
+            return
+        last_state = await self.async_get_last_state()
+        if last_state:
+            try:
+                self._attr_native_value = float(last_state.state)
+            except (TypeError, ValueError):
+                self._attr_native_value = None
+            # restore attrs if present
+            attrs = last_state.attributes or {}
+            try:
+                self._cost_accum = float(attrs.get("cost_accum", 0.0))
+            except (TypeError, ValueError):
+                self._cost_accum = 0.0
+            self._prev_kwh = _to_float_or_none(attrs.get("prev_kwh"))
+            self._prev_rate = _to_float_or_none(attrs.get("prev_rate"))
+            self._last_reset_utc = attrs.get("last_reset_utc")
+
     @staticmethod
     def determine_last_reset(
         message_datetime: datetime, meter_timezone: tzinfo, meter_interval: MeterInterval
@@ -467,18 +496,69 @@ class HildebrandGlowMqttSensor(SensorEntity):
     @staticmethod
     def get_message_datetime(mqtt_data) -> datetime:
         """Return the message timestamp as a datetime."""
-        timestamp = (
+        ts = (
             mqtt_data.get("timestamp")
             or mqtt_data.get("electricitymeter", {}).get("timestamp")
-            or mqtt_data.get("gasmeter", {}).get("timestamp")
+        or mqtt_data.get("gasmeter", {}).get("timestamp")
         )
+        if not ts:
+            raise ValueError("Valid timestamp not present in MQTT data.")
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
         try:
-            return datetime.fromisoformat(timestamp)
-        except TypeError | ValueError:
+            return datetime.fromisoformat(ts)
+        except (TypeError, ValueError):
             raise ValueError("Valid timestamp not present in MQTT data.")
 
     def process_update(self, mqtt_data) -> None:
         """Update the state of the sensor."""
+
+        # Special case: Incremental accrual for Electricity Cost (Today)
+        if self._attr_name == "Smart Meter Electricity: Cost (Today)":
+            em = mqtt_data.get("electricitymeter", {})
+            energy = em.get("energy", {}).get("import", {})
+            price = energy.get("price", {}) or {}
+            today_kwh = float(energy.get("day") or 0.0)
+            unit_rate = float(price.get("unitrate") or 0.0)
+            standing = float(price.get("standingcharge") or 0.0)
+
+            # Determine last reset in UTC using the configured meter timezone
+            msg_dt = self.get_message_datetime(mqtt_data)
+            tz_value = self._time_zone or (self.hass.config.time_zone if self.hass and self.hass.config else "UTC")
+            last_reset_utc_dt = self.determine_last_reset(msg_dt, ZoneInfo(tz_value), MeterInterval.DAY)
+            last_reset_utc_str = last_reset_utc_dt.isoformat()
+
+            # Meter-day rollover handling
+            if self._last_reset_utc != last_reset_utc_str:
+                self._cost_accum = 0.0
+                self._prev_kwh = today_kwh
+                self._prev_rate = unit_rate
+                self._last_reset_utc = last_reset_utc_str
+                self._attr_last_reset = last_reset_utc_dt
+
+            # Accrue using the previous rate
+            prev_kwh = self._prev_kwh if self._prev_kwh is not None else today_kwh
+            prev_rate = self._prev_rate if self._prev_rate is not None else unit_rate
+            delta = max(today_kwh - float(prev_kwh), 0.0)
+            self._cost_accum = float(self._cost_accum or 0.0) + delta * float(prev_rate or 0.0)
+
+            # Trackers advance
+            self._prev_kwh = today_kwh
+            self._prev_rate = unit_rate
+
+            self._attr_native_value = round(standing + self._cost_accum, 2)
+            self._attr_extra_state_attributes = {
+                "cost_accum": round(self._cost_accum, 5),
+                "prev_kwh": today_kwh,
+                "prev_rate": unit_rate,
+                "last_reset_utc": self._last_reset_utc,
+            }
+
+            if self.hass is not None:
+                self.async_schedule_update_ha_state()
+            return
+
+        # Default behavior for all other sensors
         new_value = self._func(mqtt_data)
         if self._ignore_zero_values and new_value == 0:
             _LOGGER.debug(
@@ -516,4 +596,15 @@ class HildebrandGlowMqttSensor(SensorEntity):
     @property
     def extra_state_attributes(self):
         """Return the state attributes."""
-        return {ATTR_DEVICE_ID: self._device_id}
+        base = {ATTR_DEVICE_ID: self._device_id}
+        extra = getattr(self, "_attr_extra_state_attributes", None)
+        if isinstance(extra, dict):
+            base.update(extra)
+        return base
+
+
+def _to_float_or_none(val):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
