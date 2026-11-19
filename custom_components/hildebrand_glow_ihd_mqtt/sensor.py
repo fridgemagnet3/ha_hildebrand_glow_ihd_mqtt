@@ -274,7 +274,7 @@ GAS_SENSORS = [
     # Removed June 2022 in IHD software update 1.8.13
     # {
     #   "name": "Smart Meter Gas: Power",
-    #   "device_class": SensorDeviceClass.POWER",
+    #   "device_class": SensorDeviceClass.POWER,
     #   "unit_of_measurement": UnitOfPower.KILO_WATT,
     #   "state_class": SensorStateClass.MEASUREMENT,
     #   "icon": "mdi:fire",
@@ -559,7 +559,18 @@ class HildebrandGlowMqttSensor(RestoreEntity, SensorEntity):
             return
 
         # Default behavior for all other sensors
-        new_value = self._func(mqtt_data)
+        try:
+            new_value = self._func(mqtt_data)
+        except (KeyError, TypeError) as err:
+            # A payload without this field must not break the other sensors or
+            # flood the log, so keep the previous state.
+            _LOGGER.debug(
+                "Skipped update of %s, payload is missing a value: %r",
+                self._attr_unique_id,
+                err,
+            )
+            return
+
         if self._ignore_zero_values and new_value == 0:
             _LOGGER.debug(
                 "Ignored new value of %s on %s.", new_value, self._attr_unique_id
@@ -582,11 +593,17 @@ class HildebrandGlowMqttSensor(RestoreEntity, SensorEntity):
             zoneInfo = self.hass.config.time_zone
             
         if zoneInfo and self._last_reset_reported and self._meter_interval:
-            self._attr_last_reset = self.determine_last_reset(
-                self.get_message_datetime(mqtt_data),
-                ZoneInfo(zoneInfo),
-                self._meter_interval
-            )
+            try:
+                message_datetime = self.get_message_datetime(mqtt_data)
+            except ValueError:
+                _LOGGER.debug(
+                    "No valid timestamp for %s, keeping the previous last_reset.",
+                    self._attr_unique_id,
+                )
+            else:
+                self._attr_last_reset = self.determine_last_reset(
+                    message_datetime, ZoneInfo(zoneInfo), self._meter_interval
+                )
 
         if (
             self.hass is not None
